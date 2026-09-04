@@ -1,0 +1,472 @@
+---
+title: "Delivery & Newborn Claims Counts vs. TX Vital Statistics"
+format: html
+---
+
+## Overview
+
+Compares two independent claims-based counts against `colour.ref_vital_stats_tx`
+(CDC WONDER TX birth counts by source of payment for delivery), each of which
+should approximate vital-stats **births** in its own way:
+
+- **Deliveries** (`colour.delivery_records_insurance_stg`, built from the
+  `Delivery` tab of the Orr 2024 codelist, age > 12) - a person-year-grain
+  staging table. Two counts are pulled from it, since a delivery episode and
+  a birth aren't the same thing once twins are in the mix:
+  - **`n_mothers`** - `COUNT(DISTINCT pers_id)`, i.e. distinct people with a
+    qualifying delivery in that year
+  - **`n_babies`** - the same deliveries, summed by `baby_count`, so a set of
+    twins contributes 2. This is the count that should line up with vital
+    stats births, while `n_mothers` will run slightly below it.
+- **Newborns** (`colour.newborn_records_insurance_stg`, built from the
+  `newborn` tab of the codelist, age < 1) - a person-year-grain staging
+  table. Only one count applies here:
+  - **`n_newborns`** - `COUNT(DISTINCT pers_id)`, i.e. distinct newborns
+    identified in claims that year
+
+Both pipelines assign insurance the same way - `prim_med_plan` from
+`research_di.agg_yr_plan` for that year (an enrollment-based check) - so the
+`ins` categories line up 1:1 across deliveries, newborns, and vital stats:
+
+| Claims (`ins`) | `prim_med_plan` values                                                              | Vital stats                                  |
+|-----------------|--------------------------------------------------------------------------------------|-----------------------------------------------|
+| Medicaid         | Medicaid                                                                              | `medicaid`                                     |
+| Commercial       | Commercial, Com-Ers, Com-ErsTrs, Com-Trs                                              | `private_insurance`                            |
+| Other            | Medicare Advantage(+ Imputed), Medicare FFS, Medicare Imputed, Federal, Not Enrolled  | `self_pay` + `other` + `unknown_or_not_stated` |
+| Total            | (all of the above)                                                                    | `total`                                        |
+
+Both tables below carry a per-year **Total** row (summed across insurance
+categories) alongside the by-category breakdown, and both report a raw
+difference (`claims - vital`) and a % difference (`diff / vital`) so
+over/under-capture is easy to spot at a glance.
+
+```{r}
+#| label: setup
+#| message: false
+
+pacman::p_load(RPostgres, DBI, keyring, glue, tidyverse, scales, gt, openxlsx)
+```
+
+```{r}
+#| label: connect
+
+greenplum_user <- "jwozny"
+
+uthealth <- dbConnect(
+  RPostgres::Postgres(),
+  dbname   = "apcd_dev",
+  user     = greenplum_user,
+  password = keyring::key_get("apcd_dev", greenplum_user),
+  host     = "spgpcdplv001",
+  bigint   = "integer"
+)
+```
+
+```{r}
+#| label: pull-vital-stats
+
+vital_stats <- dbGetQuery(uthealth, "
+  SELECT * FROM colour.ref_vital_stats_tx
+  WHERE year >= 2019
+  ORDER BY year
+") |>
+  as_tibble()
+
+vital_stats
+```
+
+```{r}
+#| label: reshape-vital-stats
+
+# Collapse to the same 4 buckets (3 insurance categories + Total) that both
+# claims-side tables use, so joins below are a straight (year, ins) match.
+vital_long <- vital_stats |>
+  transmute(
+    year,
+    Medicaid   = medicaid,
+    Commercial = private_insurance,
+    Other      = self_pay + other + unknown_or_not_stated,
+    Total      = total
+  ) |>
+  pivot_longer(
+    cols = c(Medicaid, Commercial, Other, Total),
+    names_to  = "ins",
+    values_to = "vital_n"
+  )
+
+vital_long
+```
+
+```{r}
+#| label: ins-order
+
+# Shared factor levels so both output tables sort Medicaid / Commercial /
+# Other / Total consistently within each year.
+ins_levels <- c("Medicaid", "Commercial", "Other", "Total")
+```
+
+## Deliveries (Mothers + Babies)
+
+```{r}
+#| label: pull-delivery-counts
+
+delivery_claims <- dbGetQuery(uthealth, "
+  SELECT year, ins,
+         count(DISTINCT pers_id) AS n_mothers,
+         sum(baby_count)         AS n_babies
+  FROM colour.delivery_records_insurance_stg
+  GROUP BY year, ins
+  ORDER BY year, ins
+") |>
+  as_tibble() |>
+  # Fold the QC-only 'Not Enrolled' bucket into 'Other' so the categories
+  # line up 1:1 with the 3-way vital stats split.
+  mutate(ins = if_else(ins == "Not Enrolled", "Other", ins)) |>
+  group_by(year, ins) |>
+  summarise(
+    n_mothers = sum(n_mothers),
+    n_babies  = sum(n_babies),
+    .groups = "drop"
+  )
+
+delivery_claims
+```
+
+```{r}
+#| label: delivery-add-total-row
+
+delivery_total <- delivery_claims |>
+  group_by(year) |>
+  summarise(
+    n_mothers = sum(n_mothers),
+    n_babies  = sum(n_babies),
+    .groups = "drop"
+  ) |>
+  mutate(ins = "Total")
+
+delivery_all <- bind_rows(delivery_claims, delivery_total) |>
+  mutate(ins = factor(ins, levels = ins_levels)) |>
+  arrange(year, ins)
+
+delivery_all
+```
+
+```{r}
+#| label: delivery-compare
+
+delivery_comparison <- delivery_all |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_mothers     = n_mothers - vital_n,
+    pct_diff_mothers = diff_mothers / vital_n,
+    diff_babies      = n_babies - vital_n,
+    pct_diff_babies  = diff_babies / vital_n
+  ) |>
+  arrange(year, ins)
+
+delivery_comparison
+```
+
+```{r}
+#| label: table-deliveries
+
+delivery_comparison |>
+  mutate(
+    pct_diff_mothers = percent(pct_diff_mothers, accuracy = 0.1),
+    pct_diff_babies  = percent(pct_diff_babies, accuracy = 0.1)
+  ) |>
+  gt(groupname_col = "year") |>
+  tab_header(title = "Claims-Identified Deliveries vs. TX Vital Statistics Births") |>
+  cols_label(
+    ins               = "Insurance Category",
+    n_mothers         = "Claims Mothers",
+    n_babies          = "Claims Births (baby_count-adj.)",
+    vital_n           = "Vital Stats Births",
+    diff_mothers      = "Diff (Mothers)",
+    pct_diff_mothers  = "% Diff (Mothers)",
+    diff_babies       = "Diff (Births)",
+    pct_diff_babies   = "% Diff (Births)"
+  ) |>
+  fmt_number(columns = c(n_mothers, n_babies, vital_n, diff_mothers, diff_babies), decimals = 0)
+```
+
+```{r}
+#| label: fig-deliveries
+#| fig-cap: "Claims-identified births (baby_count-adjusted) vs. vital statistics births, by insurance category"
+
+delivery_comparison |>
+  filter(ins != "Total") |>
+  pivot_longer(cols = c(n_babies, vital_n), names_to = "source", values_to = "n") |>
+  mutate(source = recode(source, n_babies = "Claims (Births)", vital_n = "Vital Stats")) |>
+  ggplot(aes(x = year, y = n, color = source)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins, scales = "free_y") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count", color = NULL) +
+  theme_minimal()
+```
+
+## Newborns
+
+```{r}
+#| label: pull-newborn-counts
+
+newborn_claims <- dbGetQuery(uthealth, "
+  SELECT year, ins,
+         count(DISTINCT pers_id) AS n_newborns
+  FROM colour.newborn_records_insurance_stg
+  GROUP BY year, ins
+  ORDER BY year, ins
+") |>
+  as_tibble() |>
+  mutate(ins = if_else(ins == "Not Enrolled", "Other", ins)) |>
+  group_by(year, ins) |>
+  summarise(
+    n_newborns = sum(n_newborns),
+    .groups = "drop"
+  )
+
+newborn_claims
+```
+
+```{r}
+#| label: newborn-add-total-row
+
+newborn_total <- newborn_claims |>
+  group_by(year) |>
+  summarise(
+    n_newborns = sum(n_newborns),
+    .groups = "drop"
+  ) |>
+  mutate(ins = "Total")
+
+newborn_all <- bind_rows(newborn_claims, newborn_total) |>
+  mutate(ins = factor(ins, levels = ins_levels)) |>
+  arrange(year, ins)
+
+newborn_all
+```
+
+```{r}
+#| label: newborn-compare
+
+newborn_comparison <- newborn_all |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_newborns     = n_newborns - vital_n,
+    pct_diff_newborns = diff_newborns / vital_n
+  ) |>
+  arrange(year, ins)
+
+newborn_comparison
+```
+
+```{r}
+#| label: table-newborns
+
+newborn_comparison |>
+  mutate(pct_diff_newborns = percent(pct_diff_newborns, accuracy = 0.1)) |>
+  gt(groupname_col = "year") |>
+  tab_header(title = "Claims-Identified Newborns vs. TX Vital Statistics Births") |>
+  cols_label(
+    ins               = "Insurance Category",
+    n_newborns        = "Claims Newborns",
+    vital_n           = "Vital Stats Births",
+    diff_newborns     = "Diff (Newborns)",
+    pct_diff_newborns = "% Diff (Newborns)"
+  ) |>
+  fmt_number(columns = c(n_newborns, vital_n, diff_newborns), decimals = 0)
+```
+
+```{r}
+#| label: fig-newborns
+#| fig-cap: "Claims-identified newborns vs. vital statistics births, by insurance category"
+
+newborn_comparison |>
+  filter(ins != "Total") |>
+  pivot_longer(cols = c(n_newborns, vital_n), names_to = "source", values_to = "n") |>
+  mutate(source = recode(source, n_newborns = "Claims (Newborns)", vital_n = "Vital Stats")) |>
+  ggplot(aes(x = year, y = n, color = source)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins, scales = "free_y") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count", color = NULL) +
+  theme_minimal()
+```
+
+## Overall Summary
+
+Combines just the per-year **Total** rows from both pipelines (all insurance
+categories combined) into one high-level table.
+
+```{r}
+#| label: overall-compare
+
+overall_comparison <- delivery_comparison |>
+  filter(ins == "Total") |>
+  select(year, vital_n, n_mothers, diff_mothers, pct_diff_mothers,
+         n_babies, diff_babies, pct_diff_babies) |>
+  left_join(
+    newborn_comparison |>
+      filter(ins == "Total") |>
+      select(year, n_newborns, diff_newborns, pct_diff_newborns),
+    by = "year"
+  )
+
+overall_comparison
+```
+
+```{r}
+#| label: table-overall
+
+overall_comparison |>
+  mutate(
+    pct_diff_mothers  = percent(pct_diff_mothers, accuracy = 0.1),
+    pct_diff_babies   = percent(pct_diff_babies, accuracy = 0.1),
+    pct_diff_newborns = percent(pct_diff_newborns, accuracy = 0.1)
+  ) |>
+  gt() |>
+  tab_header(title = "Overall (All Insurance Categories Combined) vs. TX Vital Statistics Births") |>
+  cols_label(
+    year              = "Year",
+    vital_n           = "Vital Stats Births",
+    n_mothers         = "Claims Mothers",
+    diff_mothers      = "Diff (Mothers)",
+    pct_diff_mothers  = "% Diff (Mothers)",
+    n_babies          = "Claims Births (baby_count-adj.)",
+    diff_babies       = "Diff (Births)",
+    pct_diff_babies   = "% Diff (Births)",
+    n_newborns        = "Claims Newborns",
+    diff_newborns     = "Diff (Newborns)",
+    pct_diff_newborns = "% Diff (Newborns)"
+  ) |>
+  fmt_number(
+    columns = c(vital_n, n_mothers, diff_mothers, n_babies, diff_babies, n_newborns, diff_newborns),
+    decimals = 0
+  )
+```
+
+## Export to Excel
+
+Four tabs, each a real Excel Table (banded rows + filter dropdowns, via
+`writeDataTable()`) except Steps, which is documentation:
+
+1. **Overall** - Total-row-only summary across both pipelines (first tab)
+2. **Deliveries** - mother count + baby count vs. vital stats, by category + Total
+3. **Newborns** - person count vs. vital stats, by category + Total
+4. **Steps** - methodology notes (last tab)
+
+```{r}
+#| label: export-to-excel
+
+# -- EDIT THIS --------------------------------------------------
+out_path <- here::here("claims_vs_vital_stats_comparison.xlsx")
+# -----------------------------------------------------------------
+
+wb <- createWorkbook()
+
+table_style <- "TableStyleMedium9"
+
+addWorksheet(wb, "Overall")
+writeDataTable(wb, "Overall", overall_comparison, tableStyle = table_style)
+
+addWorksheet(wb, "Deliveries")
+writeDataTable(wb, "Deliveries", delivery_comparison, tableStyle = table_style)
+
+addWorksheet(wb, "Newborns")
+writeDataTable(wb, "Newborns", newborn_comparison, tableStyle = table_style)
+
+# writeDataTable doesn't take a numFmt arg, so percent formatting is
+# applied as a separate style pass on top of the table
+pct_style <- createStyle(numFmt = "0.0%")
+
+addStyle(
+  wb, "Overall", pct_style,
+  rows = 2:(nrow(overall_comparison) + 1),
+  cols = which(names(overall_comparison) %in% c("pct_diff_mothers", "pct_diff_babies", "pct_diff_newborns")),
+  gridExpand = TRUE
+)
+addStyle(
+  wb, "Deliveries", pct_style,
+  rows = 2:(nrow(delivery_comparison) + 1),
+  cols = which(names(delivery_comparison) %in% c("pct_diff_mothers", "pct_diff_babies")),
+  gridExpand = TRUE
+)
+addStyle(
+  wb, "Newborns", pct_style,
+  rows = 2:(nrow(newborn_comparison) + 1),
+  cols = which(names(newborn_comparison) %in% c("pct_diff_newborns")),
+  gridExpand = TRUE
+)
+
+# openxlsx's widths = "auto" is unreliable about leaving room for the
+# header text itself (it can underestimate and clip column names), so
+# size each column explicitly off the wider of the header name or its
+# longest formatted value instead.
+set_widths_for_headers <- function(wb, sheet, df) {
+  col_widths <- vapply(seq_along(df), function(i) {
+    header_len <- nchar(names(df)[i])
+    data_len   <- max(nchar(format(df[[i]])), na.rm = TRUE)
+    max(header_len, data_len) + 2
+  }, numeric(1))
+  setColWidths(wb, sheet, cols = seq_along(df), widths = col_widths)
+}
+
+set_widths_for_headers(wb, "Overall", overall_comparison)
+set_widths_for_headers(wb, "Deliveries", delivery_comparison)
+set_widths_for_headers(wb, "Newborns", newborn_comparison)
+
+# ------------------------------------------------------------------
+# Steps tab (methodology notes - plain text, not a data table)
+# ------------------------------------------------------------------
+
+steps_text <- c(
+  "Get counts and compare to vital stats",
+  "",
+  "Infants:",
+  "- Get all claims using \"Newborn Codes\" tab of Orr codelists (CPT and DX)",
+  "- Filter ids to age < 1 in enrollment table",
+  "- Get count distinct people",
+  "",
+  "Deliveries:",
+  "- Get all claims using \"Delivery Codes\" tab of Orr codelists (CPT and DX)",
+  "- Filter ids to those age > 12 in enrollment table (or left join to get those whose info is missing for the year)",
+  "- Get one instance per person per year taking the maximum baby count for that year (for non-babycount codes, coalesce value of 1)",
+  "",
+  "Notes:",
+  "- There is overlap of codes between deliveries and codesets",
+  "- Vital Stats are recorded as the mother's insurance (not necessarily the baby's)",
+  "- NY Vital Stats: Link",
+  "- TX Vital Stats:"
+)
+header_rows <- c(1, 3, 8, 13)
+tx_row      <- length(steps_text)
+
+# -- EDIT THIS: the jsessionid pasted in chat is a temporary session
+# token that will have expired - swap in a fresh/permanent query URL
+# if you have one -----------------------------------------------
+tx_url <- "https://wonder.cdc.gov/controller/datarequest/D149"
+# -----------------------------------------------------------------
+
+addWorksheet(wb, "Steps")
+writeData(wb, "Steps", steps_text, colNames = FALSE)
+addStyle(wb, "Steps", createStyle(textDecoration = "bold", fontSize = 12), rows = header_rows, cols = 1)
+
+class(tx_url) <- "hyperlink"
+writeData(wb, "Steps", x = tx_url, startCol = 2, startRow = tx_row)
+
+setColWidths(wb, "Steps", cols = 1, widths = 100)
+setColWidths(wb, "Steps", cols = 2, widths = 55)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("Wrote comparison workbook to", out_path, "\n")
+```
+
+```{r}
+#| label: disconnect
+
+dbDisconnect(uthealth)
+```

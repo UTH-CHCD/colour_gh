@@ -1,0 +1,158 @@
+---
+title: "Build Reference Table: Orr 2024 Codelists"
+format: html
+---
+
+## Overview
+
+Reads every sheet in `Orr2024_Codelists.xlsx` (Delivery, Delivery Twin Excl.,
+Newborn, Newborn Twin Excl., Stillbirth Excl.), stacks them into a single long
+table, cleans column names with `janitor`, and writes the result to
+`colour.ref_orr2024_codelists` on Greenplum.
+
+Each sheet already carries a `Tab` column identifying its source list, so the
+stacked table is self-labeling - no extra join key needed.
+
+The `Delivery` and `Delivery Twin Excl.` sheets now also carry a `Baby Count`
+column (number of infants implied by that ICD-10-CM code, sourced from
+BabyCounts.xlsx). It's only populated for ICD-10-CM diagnosis rows on those
+two sheets - CPT/ICD-10-PCS procedure codes and the other three sheets don't
+have a baby count and stack in as `NA`. `map_dfr()` handles the ragged
+columns fine, but since it's read in as text like everything else, it gets
+coerced to integer after cleaning so it lands as a numeric column on
+Greenplum instead of text.
+
+```{r}
+#| label: setup
+#| message: false
+
+pacman::p_load(RPostgres, DBI, keyring, janitor, tidyverse, readxl, stringi)
+
+current_dir <- here::here()
+```
+
+```{r}
+#| label: params
+
+# -- EDIT THESE ----------------------------------------------
+# Codelist file lives one directory up from the project root, in /data
+xlsx_path    <- here::here("..", "data", "Orr2024_Codelists_with_baby_count.xlsx")
+target_schema <- "colour"
+target_table  <- "ref_orr2024_codelists"
+# ------------------------------------------------------------
+```
+
+```{r}
+#| label: read-and-stack
+
+sheet_names <- excel_sheets(xlsx_path)
+
+codelists <- map_dfr(
+  sheet_names,
+  ~ read_excel(xlsx_path, sheet = .x, col_types = "text") |>
+    mutate(source_sheet = .x)
+) |>
+  clean_names()
+
+glimpse(codelists)
+count(codelists, tab)
+count(codelists, tab, has_baby_count = !is.na(baby_count))
+```
+
+```{r}
+#| label: clean-funky-characters
+
+clean_text <- function(x) {
+  x |>
+    stri_trans_general("Any-Latin; Latin-ASCII") |>  # smart quotes, dashes, accents -> ASCII
+    str_replace_all("[\u00A0\u2007\u202F]", " ") |>   # non-breaking / narrow spaces -> regular space
+    str_replace_all("\\s+", " ") |>                   # collapse repeated whitespace
+    str_trim()
+}
+
+codelists <- codelists |>
+  mutate(across(where(is.character), clean_text))
+
+glimpse(codelists)
+```
+
+```{r}
+#| label: type-baby-count
+
+# baby_count comes in as text (col_types = "text" on the read) - coerce to
+# integer so it writes to Greenplum as a numeric column, not text. Compare
+# NA counts before/after so a stray non-numeric value (e.g. a typo'd cell)
+# fails loudly instead of silently becoming NA.
+na_before <- sum(is.na(codelists$baby_count))
+
+codelists <- codelists |>
+  mutate(baby_count = as.integer(baby_count))
+
+na_after <- sum(is.na(codelists$baby_count))
+
+stopifnot(
+  "as.integer() introduced new NAs in baby_count - check for non-numeric values" =
+    na_after == na_before
+)
+
+count(codelists, tab, baby_count)
+```
+
+```{r}
+#| label: connect
+
+# Same Greenplum server/credentials as the other pipelines (apcd-paper2,
+# POEM TX paper1 v24) - different database (uthealth).
+greenplum_user <- "jwozny"
+
+uthealth <- dbConnect(
+  RPostgres::Postgres(),
+  dbname   = "apcd_dev",
+  user     = greenplum_user,
+  password = keyring::key_get("apcd_dev", greenplum_user),
+  host     = "spgpcdplv001",
+  bigint   = "integer"
+)
+```
+
+
+
+```{r}
+#| label: write-table
+
+dbWriteTable(
+  uthealth,
+  Id(schema = target_schema, table = target_table),
+  codelists,
+  overwrite = TRUE
+)
+
+cat(
+  "Wrote", nrow(codelists), "rows to",
+  paste0(target_schema, ".", target_table), "\n"
+)
+```
+
+```{r}
+#| label: verify
+
+check <- dbGetQuery(
+  uthealth,
+  glue::glue_sql(
+    "SELECT tab,
+            count(*) AS n,
+            count(baby_count) AS n_with_baby_count
+     FROM {`target_schema`}.{`target_table`}
+     GROUP BY tab
+     ORDER BY tab",
+    .con = uthealth
+  )
+)
+check
+```
+
+```{r}
+#| label: disconnect
+
+dbDisconnect(uthealth)
+```

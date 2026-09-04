@@ -1,0 +1,820 @@
+---
+title: "Infant and Delivery Identification: Enrollment/Claim/Delivery Windows"
+format:
+  docx:
+    toc: false
+    toc-depth: 2
+    fig-width: 7
+    fig-height: 4.5
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+## Overview
+
+Infants start from the DOB spine: every person with a single DOB
+on or after 2019-01-01. Claims are measured against that spine rather than
+defining it. Enrollment beginning within 12 months of the DOB is the entry
+requirement; two claim measures are then reported against that denominator:
+
+1. A newborn-code claim, within 7, 30, 60 or 90 days of the DOB.
+2. Any claim at all, within 30, 60 or 90 days of the DOB.
+
+Deliveries are pseudo-episodes: claims collapsed on overlapping date
+spans, anchored on the CPT procedure date where one exists. 
+
+```{r}
+#| label: setup
+
+pacman::p_load(RPostgres, DBI, keyring, glue, tidyverse, scales,
+               flextable, officer, openxlsx, here)
+
+# gt's Word output is unreliable under Quarto docx, so flextable.
+set_flextable_defaults(font.size = 9, padding = 3)
+
+ft <- function(df, caption = NULL) {
+  x <- flextable(df) |>
+    theme_booktabs() |>
+    align(align = "right", part = "all") |>
+    align(j = 1, align = "left", part = "all") |>
+    autofit()
+  if (!is.null(caption)) x <- set_caption(x, caption)
+  x
+}
+```
+
+```{r}
+#| label: connect
+
+greenplum_user <- "jwozny"
+
+uthealth <- dbConnect(
+  RPostgres::Postgres(),
+  dbname   = "apcd_dev",
+  user     = greenplum_user,
+  password = keyring::key_get("apcd_dev", greenplum_user),
+  host     = "spgpcdplv001",
+  bigint   = "numeric"
+)
+```
+
+```{r}
+#| label: parameters
+
+# Windows used by the tables and the Excel export.
+enroll_window_months <- 12    # 1-12
+nb_claim_window_days <- 30    # 7, 30, 60, 90
+any_claim_window_days <- 30   # 7, 30, 60, 90; drives the summary table only
+
+# A window month is 30 days, so 12 months = 360. SUMMARY B in
+# create_newborn_records_v2.sql uses 365.
+
+year_min <- 2019
+year_max <- 2025
+
+# Last birth year with 12 months of follow-up. Later cohorts are censored,
+# not low, so the figures drop them.
+last_complete_birth_year <- 2024
+
+# Shortest plausible interval between separate deliveries.
+min_preg_gap_days <- 270
+# -----------------------------------------------------------------
+
+enroll_window_days <- enroll_window_months * 30
+ins_levels <- c("Medicaid", "Commercial", "Other", "Total")
+
+# Categories printed in the infant tables. Other is held back for now; it is
+# still inside Total and still used for the vital statistics comparison.
+ins_show <- c("Medicaid", "Commercial", "Total")
+
+complete_years_label <- glue("{year_min}-{last_complete_birth_year}")
+```
+
+```{r}
+#| label: helpers
+
+# 'Not Enrolled' folded into 'Other' to match the 3-way vital stats split.
+fold_not_enrolled <- function(df, keys, value_cols) {
+  df |>
+    mutate(ins = if_else(ins == "Not Enrolled", "Other", ins)) |>
+    group_by(across(all_of(c(keys, "ins")))) |>
+    summarise(across(all_of(value_cols), sum), .groups = "drop")
+}
+
+add_ins_total <- function(df, keys, value_cols) {
+  totals <- df |>
+    group_by(across(all_of(keys))) |>
+    summarise(across(all_of(value_cols), sum), .groups = "drop") |>
+    mutate(ins = "Total")
+
+  bind_rows(df, totals) |>
+    mutate(ins = factor(ins, levels = ins_levels)) |>
+    arrange(!!!syms(c(keys, "ins")))
+}
+
+ins_colours <- c(Medicaid = "#1b7837", Commercial = "#2166ac",
+                 Other = "#b2182b", Total = "grey30")
+scale_ins <- function() scale_colour_manual(values = ins_colours, drop = FALSE)
+```
+
+# Infants
+
+## Cohort
+
+Everyone with a single DOB in range, and how many of them enrol within
+`r enroll_window_months` months of it. The denominator here is the birth cohort.
+
+```{r}
+#| label: pull-summary
+
+summary_raw <- dbGetQuery(uthealth, glue("
+  SELECT birth_year,
+         COUNT(*) AS n_spine,
+         SUM(CASE WHEN days_to_enroll <= {enroll_window_days} THEN 1 ELSE 0 END)
+           AS n_enrolled_in_window,
+         SUM(CASE WHEN days_to_enroll <= {enroll_window_days}
+                   AND nb_claim_{nb_claim_window_days}d = 1
+                  THEN 1 ELSE 0 END) AS n_nb_claim,
+         SUM(CASE WHEN days_to_enroll <= {enroll_window_days}
+                   AND any_claim_{any_claim_window_days}d = 1
+                  THEN 1 ELSE 0 END) AS n_any_claim
+  FROM colour.infant_records
+  WHERE birth_year BETWEEN {year_min} AND {year_max}
+  GROUP BY 1 ORDER BY 1
+")) |> as_tibble()
+
+count_cols <- c("n_spine", "n_enrolled_in_window", "n_nb_claim", "n_any_claim")
+
+# One row per birth year plus a pooled row over the complete cohorts.
+summary_all <- bind_rows(
+  summary_raw |> mutate(birth_year = as.character(birth_year)),
+  summary_raw |>
+    filter(birth_year <= last_complete_birth_year) |>
+    summarise(across(all_of(count_cols), sum)) |>
+    mutate(birth_year = complete_years_label)
+)
+
+cohort_tbl <- summary_all |>
+  select(birth_year, n_spine, n_enrolled_in_window) |>
+  mutate(pct_enrolled = n_enrolled_in_window / n_spine)
+
+cohort_tbl |>
+  mutate(across(starts_with("n_"), ~ comma(.x, accuracy = 1)),
+         pct_enrolled = percent(pct_enrolled, accuracy = 0.1)) |>
+  ft(glue("Persons with a single DOB on/after 2019-01-01, and those whose ",
+          "coverage begins within {enroll_window_months} months of the DOB. ",
+          "Percent is of n_spine. Birth years after ",
+          "{last_complete_birth_year} lack full follow-up."))
+```
+
+## Claims after birth
+
+Everything from here on drops the never-enrolled and the late enrollers: the
+denominator is `n_enrolled_in_window` from the table above, not the birth
+cohort.
+
+```{r}
+#| label: table-claim-summary
+
+claim_summary_tbl <- summary_all |>
+  select(birth_year, n_enrolled_in_window, n_nb_claim, n_any_claim) |>
+  mutate(pct_nb_claim  = n_nb_claim  / n_enrolled_in_window,
+         pct_any_claim = n_any_claim / n_enrolled_in_window) |>
+  select(birth_year, n_enrolled_in_window,
+         n_nb_claim, pct_nb_claim, n_any_claim, pct_any_claim)
+
+claim_summary_tbl |>
+  mutate(across(starts_with("n_"), ~ comma(.x, accuracy = 1)),
+         across(starts_with("pct_"), ~ percent(.x, accuracy = 0.1))) |>
+  ft(glue("Newborn-code claim within {nb_claim_window_days} days and any ",
+          "claim within {any_claim_window_days} days of the DOB, out of ",
+          "infants enrolling within {enroll_window_months} months"))
+```
+
+The same two measures split by payer follow. Total is all payers; the Other
+category is held back for now, so the named rows do not sum to it.
+
+```{r}
+#| label: pull-infant-claims
+
+infant_claims_raw <- dbGetQuery(uthealth, glue("
+  SELECT birth_year AS year,
+         ins,
+         COUNT(*) AS n_enrolled_in_window,
+         SUM(any_claim_30d) AS n_any_30d,
+         SUM(any_claim_60d) AS n_any_60d,
+         SUM(any_claim_90d) AS n_any_90d,
+         SUM(nb_claim_{nb_claim_window_days}d) AS n_with_claim
+  FROM colour.infant_records
+  WHERE days_to_enroll <= {enroll_window_days}
+    AND birth_year BETWEEN {year_min} AND {year_max}
+  GROUP BY 1, 2 ORDER BY 1, 2
+")) |> as_tibble()
+
+claim_value_cols <- c("n_enrolled_in_window", "n_any_30d", "n_any_60d",
+                      "n_any_90d", "n_with_claim")
+
+# Totals are built over every category, then Other is dropped from display.
+infant_claims <- infant_claims_raw |>
+  fold_not_enrolled(keys = "year", value_cols = claim_value_cols) |>
+  add_ins_total(keys = "year", value_cols = claim_value_cols)
+```
+
+### Newborn-code claims
+
+```{r}
+#| label: infant-headline
+
+infant_counts <- infant_claims |>
+  select(year, ins, n_enrolled_in_window, n_with_claim) |>
+  mutate(pct_with_claim = n_with_claim / n_enrolled_in_window)
+
+infant_counts |>
+  filter(ins %in% ins_show) |>
+  mutate(across(c(n_enrolled_in_window, n_with_claim), ~ comma(.x, accuracy = 1)),
+         pct_with_claim = percent(pct_with_claim, accuracy = 0.1)) |>
+  ft(glue("Infants at {enroll_window_months}-month enrollment / ",
+          "{nb_claim_window_days}-day newborn-code claim window"))
+```
+
+### Any claim
+
+No code filter: any medical claim line under the infant's own `pers_id` dated on
+or after the DOB counts.
+
+```{r}
+#| label: table-any-claim
+
+any_claim_counts <- infant_claims |>
+  select(year, ins, n_enrolled_in_window, n_any_30d, n_any_60d, n_any_90d) |>
+  mutate(pct_any_30d = n_any_30d / n_enrolled_in_window,
+         pct_any_60d = n_any_60d / n_enrolled_in_window,
+         pct_any_90d = n_any_90d / n_enrolled_in_window)
+
+any_claim_counts |>
+  filter(ins %in% ins_show) |>
+  select(year, ins, n_enrolled_in_window,
+         pct_any_30d, pct_any_60d, pct_any_90d) |>
+  mutate(n_enrolled_in_window = comma(n_enrolled_in_window, accuracy = 1),
+         across(starts_with("pct_"), ~ percent(.x, accuracy = 0.1))) |>
+  ft(glue("Infants with any claim within 30/60/90 days of the DOB, out of ",
+          "those enrolling within {enroll_window_months} months"))
+```
+
+```{r}
+#| label: fig-any-claim
+
+any_claim_counts |>
+  filter(year <= last_complete_birth_year, ins %in% ins_show) |>
+  mutate(ins = droplevels(ins)) |>
+  select(year, ins, starts_with("n_")) |>
+  group_by(ins) |>
+  summarise(across(starts_with("n_"), sum), .groups = "drop") |>
+  pivot_longer(c(n_any_30d, n_any_60d, n_any_90d),
+               names_to = "window", values_to = "n") |>
+  mutate(window = as.integer(str_extract(window, "\\d+")),
+         pct = n / n_enrolled_in_window) |>
+  ggplot(aes(x = window, y = pct, colour = ins)) +
+  geom_line() +
+  geom_point(size = 1) +
+  scale_x_continuous(breaks = c(30, 60, 90)) +
+  scale_y_continuous(labels = percent) +
+  scale_ins() +
+  labs(x = "Days after DOB", y = "% of enrolled infants with any claim",
+       colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Deliveries
+
+## Attrition
+
+
+```{r}
+#| label: pull-delivery-attrition
+
+delivery_attrition <- dbGetQuery(uthealth, "
+  SELECT 1 AS step_num,
+         '1. Delivery code hits (any age, incl. infant claims)' AS step,
+         COUNT(DISTINCT pers_id) AS n_persons
+  FROM colour.delivery_code_hits
+  UNION ALL
+  SELECT 2, '2. Joined to claim dates in medical_adj',
+         COUNT(DISTINCT pers_id) FROM colour.delivery_claims_stg
+  UNION ALL
+  SELECT 3, '3. Age 12-50 at service, or no DOB on file',
+         COUNT(DISTINCT pers_id) FROM colour.delivery_claims_qual
+  UNION ALL
+  SELECT 4, '4. Collapsed into an episode',
+         COUNT(DISTINCT pers_id) FROM colour.delivery_episodes
+  UNION ALL
+  SELECT 5, '5. Episode dated within the analysis years',
+         COUNT(DISTINCT pers_id) FROM colour.delivery_episodes_insurance_stg
+  ORDER BY 1
+") |> as_tibble()
+
+delivery_attrition |>
+  mutate(dropped = lag(n_persons) - n_persons,
+         pct_kept = n_persons / first(n_persons)) |>
+  mutate(across(c(n_persons, dropped), ~ comma(.x, accuracy = 1)),
+         pct_kept = percent(pct_kept, accuracy = 0.1)) |>
+  select(step, n_persons, dropped, pct_kept) |>
+  ft("Distinct persons at each delivery pipeline step")
+```
+
+## Episode dating
+
+Episodes anchored on a CPT date rather than falling back to a diagnosis date.
+The date source drives the year assignment, so a large diagnosis share weakens
+the year-by-year counts.
+
+```{r}
+#| label: table-dt-src
+
+dbGetQuery(uthealth, "
+  SELECT delivery_year AS year, delivery_dt_src, COUNT(*) AS n_episodes
+  FROM colour.delivery_episodes_insurance_stg
+  GROUP BY 1, 2 ORDER BY 1, 2
+") |>
+  as_tibble() |>
+  pivot_wider(names_from = delivery_dt_src, values_from = n_episodes,
+              values_fill = 0) |>
+  mutate(pct_cpt = cpt / (cpt + diagnosis)) |>
+  mutate(across(c(cpt, diagnosis), ~ comma(.x, accuracy = 1)),
+         pct_cpt = percent(pct_cpt, accuracy = 0.1)) |>
+  ft("Episode delivery date source by year")
+```
+
+## Delivery counts
+
+One instance per person per year, taking the maximum `baby_count`. `n_mothers`
+counts people; `n_babies` applies the baby count, so twins contribute 2.
+
+```{r}
+#| label: pull-delivery-counts
+
+delivery_raw <- dbGetQuery(uthealth, glue("
+  WITH person_year AS (
+    SELECT pers_id,
+           delivery_year,
+           MAX(ins)        AS ins,
+           MAX(baby_count) AS baby_count,
+           COUNT(*)        AS n_episodes
+    FROM colour.delivery_episodes_insurance_stg
+    GROUP BY pers_id, delivery_year
+  )
+  SELECT delivery_year AS year,
+         ins,
+         COUNT(*)        AS n_mothers,
+         SUM(baby_count) AS n_babies,
+         SUM(n_episodes) AS n_episodes
+  FROM person_year
+  WHERE delivery_year BETWEEN {year_min} AND {year_max}
+  GROUP BY 1, 2 ORDER BY 1, 2
+")) |> as_tibble()
+
+delivery_counts <- delivery_raw |>
+  fold_not_enrolled(keys = "year", value_cols = c("n_mothers", "n_babies", "n_episodes")) |>
+  add_ins_total(keys = "year", value_cols = c("n_mothers", "n_babies", "n_episodes"))
+
+delivery_counts |>
+  mutate(across(c(n_mothers, n_babies, n_episodes), ~ comma(.x, accuracy = 1))) |>
+  ft("Deliveries by year and insurance, after the person-year collapse")
+```
+
+```{r}
+#| label: pull-delivery-counts-raw
+
+delivery_ep_raw <- dbGetQuery(uthealth, glue("
+  SELECT delivery_year   AS year,
+         ins,
+         COUNT(*)        AS n_episodes_ep,
+         SUM(baby_count) AS n_babies_ep
+  FROM colour.delivery_episodes_insurance_stg
+  WHERE delivery_year BETWEEN {year_min} AND {year_max}
+  GROUP BY 1, 2 ORDER BY 1, 2
+")) |> as_tibble()
+
+delivery_ep_counts <- delivery_ep_raw |>
+  fold_not_enrolled(keys = "year", value_cols = c("n_episodes_ep", "n_babies_ep")) |>
+  add_ins_total(keys = "year", value_cols = c("n_episodes_ep", "n_babies_ep"))
+```
+
+
+## Length of stay versus CPT span
+
+Three measures of how long the delivery event lasted:
+
+- LOS: `discharge_dt - admit_dt`, only where an institutional claim is present.
+- CPT span: `cpt_dos_max - cpt_dos_min`, how far the procedure lines spread.
+- Episode length: `episode_end - episode_start`, the full derived span.
+
+
+```{r}
+#| label: pull-los
+
+los_marginals <- dbGetQuery(uthealth, "
+  SELECT 'LOS (discharge - admit)' AS measure,
+         LEAST(discharge_dt - admit_dt, 21) AS days,
+         COUNT(*) AS n
+  FROM colour.delivery_episodes_insurance_stg
+  WHERE admit_dt IS NOT NULL AND discharge_dt IS NOT NULL
+  GROUP BY 1, 2
+  UNION ALL
+  SELECT 'CPT span (max - min)',
+         LEAST(cpt_dos_max - cpt_dos_min, 21),
+         COUNT(*)
+  FROM colour.delivery_episodes_insurance_stg
+  WHERE cpt_dos_min IS NOT NULL AND cpt_dos_max IS NOT NULL
+  GROUP BY 1, 2
+  UNION ALL
+  SELECT 'Episode length',
+         LEAST(episode_len_days, 21),
+         COUNT(*)
+  FROM colour.delivery_episodes_insurance_stg
+  GROUP BY 1, 2
+") |> as_tibble()
+
+cpt_position <- dbGetQuery(uthealth, "
+  SELECT CASE
+           WHEN cpt_dos_min < admit_dt     THEN 'CPT before admission'
+           WHEN cpt_dos_min > discharge_dt THEN 'CPT after discharge'
+           ELSE 'CPT within the stay'
+         END AS position,
+         COUNT(*) AS n_episodes
+  FROM colour.delivery_episodes_insurance_stg
+  WHERE admit_dt IS NOT NULL AND discharge_dt IS NOT NULL
+    AND cpt_dos_min IS NOT NULL
+  GROUP BY 1 ORDER BY 2 DESC
+") |> as_tibble()
+```
+
+Distribution of the three measures, capped at 21 days.
+
+```{r}
+#| label: fig-los-marginals
+#| fig-height: 5.5
+
+los_marginals |>
+  group_by(measure) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  filter(days >= 0) |>
+  ggplot(aes(x = days, y = pct)) +
+  geom_col(width = 0.85) +
+  facet_wrap(~ measure, ncol = 1, scales = "free_y") +
+  scale_x_continuous(breaks = seq(0, 21, 3)) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Days (capped at 21)", y = "% of episodes with the measure") +
+  theme_minimal()
+```
+
+```{r}
+#| label: table-cpt-position
+
+cpt_position |>
+  mutate(pct = percent(n_episodes / sum(n_episodes), accuracy = 0.1),
+         n_episodes = comma(n_episodes, accuracy = 1)) |>
+  ft("Where the first CPT date falls relative to the recorded admission")
+```
+
+
+
+# Delivery data quality
+
+## Pregnancies per person
+
+
+```{r}
+#| label: pull-preg-per-person
+
+preg_per_person <- dbGetQuery(uthealth, "
+  SELECT n_ep, COUNT(*) AS n_persons FROM (
+    SELECT pers_id, COUNT(*) AS n_ep
+      FROM colour.delivery_episodes_insurance_stg
+     GROUP BY 1) t
+  GROUP BY 1 ORDER BY 1
+") |> as_tibble()
+
+```
+
+```{r}
+#| label: fig-preg-per-person
+
+preg_per_person |>
+  mutate(n_ep_lab = if_else(n_ep >= 6, "6+", as.character(n_ep))) |>
+  group_by(n_ep_lab) |>
+  summarise(n_persons = sum(n_persons), .groups = "drop") |>
+  mutate(n_ep_lab = factor(n_ep_lab, levels = c(as.character(1:5), "6+"))) |>
+  ggplot(aes(x = n_ep_lab, y = n_persons)) +
+  geom_col(width = 0.7) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Delivery episodes per person", y = "Persons") +
+  theme_minimal()
+```
+
+```{r}
+#| label: table-preg-per-person
+
+preg_per_person |>
+  mutate(pct = percent(n_persons / sum(n_persons), accuracy = 0.1),
+         n_persons = comma(n_persons, accuracy = 1)) |>
+  head(15) |>
+  ft("Delivery episodes per person (first 10 rows)")
+```
+
+
+
+## Gaps between pregnancies
+
+Interval between consecutive `delivery_dt` values for people with more than one
+episode. 
+
+
+```{r}
+#| label: pull-preg-gaps
+
+preg_gaps <- dbGetQuery(uthealth, "
+  WITH ordered AS (
+    SELECT pers_id,
+           delivery_dt,
+           LAG(delivery_dt) OVER (PARTITION BY pers_id ORDER BY delivery_dt) AS prev_dt
+    FROM colour.delivery_episodes_insurance_stg
+  )
+  SELECT LEAST(delivery_dt - prev_dt, 1825) AS gap_days,
+         COUNT(*) AS n
+  FROM ordered
+  WHERE prev_dt IS NOT NULL
+  GROUP BY 1 ORDER BY 1
+") |> as_tibble()
+```
+
+Full range, capped at five years.
+
+```{r}
+#| label: fig-preg-gaps
+
+preg_gaps |>
+  ggplot(aes(x = gap_days, y = n)) +
+  geom_col(width = 1) +
+  geom_vline(xintercept = min_preg_gap_days, linetype = "dotted") +
+  scale_x_continuous(breaks = seq(0, 1800, 180)) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Days between consecutive delivery dates", y = "Intervals") +
+  theme_minimal()
+```
+
+First year only, where the implausible intervals sit.
+
+```{r}
+#| label: fig-preg-gaps-short
+
+preg_gaps |>
+  filter(gap_days <= 365) |>
+  ggplot(aes(x = gap_days, y = n)) +
+  geom_col(width = 1) +
+  geom_vline(xintercept = min_preg_gap_days, linetype = "dotted") +
+  scale_x_continuous(breaks = seq(0, 365, 30)) +
+  scale_y_continuous(labels = comma) +
+  labs(x = "Days between consecutive delivery dates", y = "Intervals") +
+  theme_minimal()
+```
+
+```{r}
+#| label: table-preg-gaps
+
+preg_gaps |>
+  mutate(band = case_when(
+    gap_days <  30 ~ "Under 30 days",
+    gap_days <  90 ~ "30-89 days",
+    gap_days < 180 ~ "90-179 days",
+    gap_days < min_preg_gap_days ~ glue("180-{min_preg_gap_days - 1} days"),
+    TRUE ~ glue("{min_preg_gap_days}+ days")
+  )) |>
+  mutate(band = factor(band, levels = c("Under 30 days", "30-89 days", "90-179 days",
+                                        glue("180-{min_preg_gap_days - 1} days"),
+                                        glue("{min_preg_gap_days}+ days")))) |>
+  group_by(band) |>
+  summarise(n_intervals = sum(n), .groups = "drop") |>
+  mutate(pct = percent(n_intervals / sum(n_intervals), accuracy = 0.1),
+         n_intervals = comma(n_intervals, accuracy = 1)) |>
+  ft("Intervals between consecutive delivery dates, banded")
+```
+
+# If you only include CPT deliveries, does the weird gaps go away? 
+
+```{r}
+#| label: pull-preg-gaps-cpt
+
+preg_gaps_cpt <- dbGetQuery(uthealth, "
+  WITH ordered AS (
+    SELECT pers_id,
+           delivery_dt,
+           LAG(delivery_dt) OVER (PARTITION BY pers_id ORDER BY delivery_dt) AS prev_dt
+    FROM colour.delivery_episodes_insurance_stg
+    WHERE delivery_dt_src = 'cpt'
+  )
+  SELECT LEAST(delivery_dt - prev_dt, 1825) AS gap_days,
+         COUNT(*) AS n
+  FROM ordered
+  WHERE prev_dt IS NOT NULL
+  GROUP BY 1 ORDER BY 1
+") |> as_tibble()
+
+```
+
+```{r}
+#| label: fig-preg-gaps-cpt
+
+bind_rows(
+  preg_gaps     |> mutate(series = "All episodes"),
+  preg_gaps_cpt |> mutate(series = "CPT-dated only")
+) |>
+  group_by(series) |>
+  mutate(pct = n / sum(n)) |>
+  ungroup() |>
+  filter(gap_days <= 365) |>
+  mutate(bin = (gap_days %/% 7) * 7) |>
+  group_by(series, bin) |>
+  summarise(pct = sum(pct), .groups = "drop") |>
+  ggplot(aes(x = bin, y = pct, colour = series)) +
+  geom_line() +
+  geom_vline(xintercept = min_preg_gap_days, linetype = "dotted") +
+  scale_x_continuous(breaks = seq(0, 365, 30)) +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Days between consecutive delivery dates (7-day bins)",
+       y = "% of all intervals in the series", colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+
+# Vital statistics 
+
+
+```{r}
+#| label: pull-vital
+
+vital_long <- dbGetQuery(uthealth, glue("
+  SELECT * FROM colour.ref_vital_stats_tx
+  WHERE year BETWEEN {year_min} AND {year_max}
+  ORDER BY year
+")) |>
+  as_tibble() |>
+  transmute(
+    year,
+    Medicaid   = medicaid,
+    Commercial = private_insurance,
+    Other      = self_pay + other + unknown_or_not_stated,
+    Total      = total
+  ) |>
+  pivot_longer(c(Medicaid, Commercial, Other, Total),
+               names_to = "ins", values_to = "vital_n")
+```
+
+```{r}
+#| label: vital-comparison
+
+vital_comparison <- bind_rows(
+  delivery_counts |>
+    transmute(pipeline = "Deliveries (babies)", year, ins = as.character(ins), n = n_babies),
+  infant_counts |>
+    transmute(pipeline = glue("Infants ({nb_claim_window_days}-day claim)"),
+              year, ins = as.character(ins), n = n_with_claim)
+) |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(diff = n - vital_n,
+         pct_diff = diff / vital_n,
+         ins = factor(ins, levels = ins_levels)) |>
+  arrange(pipeline, year, ins)
+
+vital_comparison |>
+  filter(ins == "Total") |>
+  select(pipeline, year, n, vital_n, diff, pct_diff) |>
+  mutate(across(c(n, vital_n, diff), ~ comma(.x, accuracy = 1)),
+         pct_diff = percent(pct_diff, accuracy = 0.1)) |>
+  ft("Claims counts against vital statistics births, all payers")
+```
+
+Percent difference from vital statistics, by category.
+
+```{r}
+#| label: fig-vital
+
+vital_comparison |>
+  filter(ins != "Total", !is.na(pct_diff)) |>
+  ggplot(aes(x = year, y = pct_diff, colour = ins)) +
+  geom_hline(yintercept = 0, linewidth = 0.3) +
+  geom_line() +
+  geom_point(size = 1) +
+  facet_wrap(~ pipeline) +
+  scale_y_continuous(labels = percent) +
+  scale_ins() +
+  labs(x = NULL, y = "% difference from vital stats", colour = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+# Excel export
+
+
+```{r}
+#| label: export
+
+# -- EDIT THIS ----------------------------------------------------
+out_path <- here::here("infant_delivery_counts.xlsx")
+# -----------------------------------------------------------------
+
+sheets <- list(
+  "Infant Cohort"    = cohort_tbl,
+  "Infant Claim Summary" = claim_summary_tbl,
+  "Infant Counts"    = infant_counts,
+  "Any Claim Windows" = any_claim_counts,
+  "Delivery Counts"  = delivery_counts,
+  "vs Vital Stats"   = vital_comparison
+)
+
+wb <- createWorkbook()
+pct_style <- createStyle(numFmt = "0.0%")
+
+set_widths_for_headers <- function(wb, sheet, df) {
+  if (nrow(df) == 0) return(invisible(NULL))
+  col_widths <- vapply(seq_along(df), function(i) {
+    header_len <- nchar(names(df)[i])
+    data_len   <- suppressWarnings(max(nchar(format(df[[i]])), na.rm = TRUE))
+    if (!is.finite(data_len)) data_len <- 0
+    max(header_len, data_len) + 2
+  }, numeric(1))
+  setColWidths(wb, sheet, cols = seq_along(df), widths = col_widths)
+}
+
+for (sheet_name in names(sheets)) {
+  df <- sheets[[sheet_name]] |> mutate(across(where(is.factor), as.character))
+
+  addWorksheet(wb, sheet_name)
+  writeDataTable(wb, sheet_name, df, tableStyle = "TableStyleMedium9")
+
+  pct_cols <- which(grepl("^pct_", names(df)))
+  if (length(pct_cols) > 0 && nrow(df) > 0) {
+    addStyle(wb, sheet_name, pct_style,
+             rows = 2:(nrow(df) + 1), cols = pct_cols, gridExpand = TRUE)
+  }
+
+  set_widths_for_headers(wb, sheet_name, df)
+}
+
+notes_text <- c(
+  "Infant and delivery counts",
+  "",
+  glue("Headline windows: enrollment {enroll_window_months} months, ",
+       "newborn-code claim {nb_claim_window_days} days, ",
+       "any claim {any_claim_window_days} days"),
+  "",
+  "Infants (applied in sequence, none materialised in SQL):",
+  "- Spine = every person in colour.dob with a single dob on/after 2019-01-01",
+  "- Step 1: enrollment begins within the enrollment window of the DOB",
+  "- Step 2a: a newborn-code claim within the claim window of the DOB,",
+  "  among infants who cleared step 1",
+  "- Step 2b: any claim (no code filter) within 30/60/90 days of the DOB,",
+  "  among infants who cleared step 1",
+  "- Any claim = any medical_adj line under the infant's own pers_id dated",
+  "  on or after the DOB; pharmacy and dental are not included",
+  "- n_enrolled_in_window is timing-based, not ever-enrolled",
+  "- Enrollment = the coverage segment closest to the DOB; a segment spanning",
+  "  the DOB scores 0 days. Ties go to Commercial",
+  "- A window month is 30 days, so 12 months = 360 (SUMMARY B in the SQL uses 365)",
+  "- Insurance is the plan on the picked segment, not agg_yr_plan",
+  "- The Other category is inside Total but not printed in the Word tables;",
+  "  it is still in these tabs and in the vital statistics comparison",
+  glue("- Birth years after {last_complete_birth_year} lack full follow-up and are ",
+       "censored, not low. Figures pool complete cohorts only"),
+  "",
+  "Deliveries:",
+  "- Delivery Codes tab of the Orr codelists (CPT and DX; no ICD-10-PCS codes)",
+  "- Delivery and newborn code lists overlap, so infants carrying a delivery-tab",
+  "  code are picked up at step 1 of the attrition and removed by the age filter",
+  "- Persons kept where any matched claim falls at age 12-50, or where no DOB",
+  "  is on file",
+  "- Overlapping claim date spans collapsed into pseudo-episodes; the merge uses",
+  "  the full claim span, not the CPT dates, so dx-only claims can join",
+  "- Episode delivery date = first CPT line date, falling back to episode start",
+  "- Person-year collapse (max baby_count) applied in the analysis, not the SQL",
+  "- Insurance is prim_med_plan from agg_yr_plan for the delivery year",
+  "",
+  "Notes:",
+  "- Not Enrolled is folded into Other to match the 3-way vital stats split",
+  "- Vital stats record the mother's payer, not the baby's",
+  "- Data quality checks are in the Word document"
+)
+
+addWorksheet(wb, "Notes")
+writeData(wb, "Notes", notes_text, colNames = FALSE)
+setColWidths(wb, "Notes", cols = 1, widths = 95)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+cat("Wrote", out_path, "\n")
+```
+

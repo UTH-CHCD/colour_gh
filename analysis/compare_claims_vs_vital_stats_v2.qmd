@@ -1,0 +1,1025 @@
+---
+title: "Delivery & Newborn Claims Counts vs. TX Vital Statistics"
+format: html
+---
+
+## Overview
+
+Compares two independent claims-based counts against `colour.ref_vital_stats_tx`
+(CDC WONDER TX birth counts by source of payment for delivery), each of which
+should approximate vital-stats **births** in its own way:
+
+- **Deliveries** (`colour.delivery_records_insurance_stg`, built from the
+  `Delivery` tab of the Orr 2024 codelist) - a person-year-grain
+  staging table. Two counts are pulled from it, since a delivery episode and
+  a birth aren't the same thing once twins are in the mix:
+  - **`n_mothers`** - `COUNT(DISTINCT pers_id)`, i.e. distinct people with a
+    qualifying delivery in that year
+  - **`n_babies`** - the same deliveries, summed by `baby_count`, so a set of
+    twins contributes 2. This is the count that should line up with vital
+    stats births, while `n_mothers` will run slightly below it.
+- **Newborns** (`colour.newborn_records_insurance_stg`, built from the
+  `newborn` tab of the codelist) - a person-year-grain staging
+  table. Only one count applies here:
+  - **`n_newborns`** - `COUNT(DISTINCT pers_id)`, i.e. distinct newborns
+    identified in claims that year
+
+The enrollment age filters (`age > 12` for deliveries, `age < 1` for newborns)
+have been **removed** from both staging tables - the DOB criteria at stage 2 are
+now the only age control. Two consequences worth holding onto:
+
+1. **Stage 0 is looser than the old pipeline**, not equal to it. It is now every
+   person with a matched code in that year at any age, so it will run above the
+   counts these tables used to report. Stages 2-3 are the comparable numbers.
+2. **`Not Enrolled` is now a populated bucket.** The old age filters were
+   NULL-unsafe, so anyone without an `agg_yr_plan` match for that year was
+   silently dropped; without them those people survive with a NULL
+   `prim_med_plan`. They are folded into `Other` to match the 3-way vital stats
+   split, which means `Other` now carries genuinely unenrolled people on top of
+   Medicare/Federal. The *Enrollment QC* section sizes that before folding.
+
+Both pipelines assign insurance the same way - `prim_med_plan` from
+`research_di.agg_yr_plan` for that year (an enrollment-based check) - so the
+`ins` categories line up 1:1 across deliveries, newborns, and vital stats:
+
+| Claims (`ins`) | `prim_med_plan` values                                                              | Vital stats                                  |
+|-----------------|--------------------------------------------------------------------------------------|-----------------------------------------------|
+| Medicaid         | Medicaid                                                                              | `medicaid`                                     |
+| Commercial       | Commercial, Com-Ers, Com-ErsTrs, Com-Trs                                              | `private_insurance`                            |
+| Other            | Medicare Advantage(+ Imputed), Medicare FFS, Medicare Imputed, Federal, Not Enrolled  | `self_pay` + `other` + `unknown_or_not_stated` |
+| Total            | (all of the above)                                                                    | `total`                                        |
+
+Both tables below carry a per-year **Total** row (summed across insurance
+categories) alongside the by-category breakdown, and both report a raw
+difference (`claims - vital`) and a % difference (`diff / vital`) so
+over/under-capture is easy to spot at a glance.
+
+### DOB linkage and filter stages
+
+`colour.dob` is LEFT JOINed onto both claim-level staging tables, so every
+matched claim carries the person's derived DOB (`dob_derv`) and the multiple-DOB
+flag. Nothing is dropped by that join - instead each pipeline materializes a
+**cumulative filter waterfall** (`colour.delivery_counts_by_stage`,
+`colour.newborn_counts_by_stage`):
+
+| Stage | Deliveries (mothers)              | Newborns (infants)                |
+|-------|-----------------------------------|-----------------------------------|
+| 0     | All matched claims (pre-DOB)      | All matched claims (pre-DOB)      |
+| 1     | + DOB present                     | + DOB present                     |
+| 2     | + claim with age 12-50 at DOS     | + claim within 7 days of DOB      |
+| 3     | + single DOB only                 | + single DOB only                 |
+
+**The headline tables and figures below report the fully filtered population
+(stage 3).** Stage 0 - the pre-DOB numbers - and everything in between are
+in the *Delivery Stages*, *Newborn Stages*, *Claim Counts*, and *Stages vs
+Vital* tabs, so the attrition and the original counts stay one click away
+rather than being the default view. `headline_stage` in the setup below is the
+single place to change that.
+
+From stage 2 on, claim counts (and, for deliveries, `n_babies`) are restricted
+to qualifying claims only - `n_babies_asis` in the stage tables carries the
+unrestricted `baby_count` through every stage for comparison.
+`colour.*_dob_qc` splits the stage-0 population into No DOB / Single DOB /
+Multiple DOB so each exclusion can also be sized independently of the order
+they're applied in.
+
+```{r}
+#| label: setup
+#| message: false
+
+pacman::p_load(RPostgres, DBI, keyring, glue, tidyverse, scales, gt, openxlsx)
+```
+
+```{r}
+#| label: connect
+
+greenplum_user <- "jwozny"
+
+uthealth <- dbConnect(
+  RPostgres::Postgres(),
+  dbname   = "apcd_dev",
+  user     = greenplum_user,
+  password = keyring::key_get("apcd_dev", greenplum_user),
+  host     = "spgpcdplv001",
+  bigint   = "integer"
+)
+```
+
+```{r}
+#| label: headline-stage
+
+# -- EDIT THIS ----------------------------------------------------
+# Which filter stage drives the headline tables (Overall, Deliveries,
+# Newborns) and the Excel tabs built from them:
+#   0 = all matched claims (pre-DOB behaviour)
+#   1 = + DOB present
+#   2 = + qualifying claim (7-day window / age 12-50)
+#   3 = + single DOB only            <- fully filtered
+# The stage tabs always carry all four stages regardless.
+headline_stage <- 3
+# -----------------------------------------------------------------
+```
+
+```{r}
+#| label: pull-vital-stats
+
+vital_stats <- dbGetQuery(uthealth, "
+  SELECT * FROM colour.ref_vital_stats_tx
+  WHERE year >= 2019
+  ORDER BY year
+") |>
+  as_tibble()
+
+vital_stats
+```
+
+```{r}
+#| label: reshape-vital-stats
+
+# Collapse to the same 4 buckets (3 insurance categories + Total) that both
+# claims-side tables use, so joins below are a straight (year, ins) match.
+vital_long <- vital_stats |>
+  transmute(
+    year,
+    Medicaid   = medicaid,
+    Commercial = private_insurance,
+    Other      = self_pay + other + unknown_or_not_stated,
+    Total      = total
+  ) |>
+  pivot_longer(
+    cols = c(Medicaid, Commercial, Other, Total),
+    names_to  = "ins",
+    values_to = "vital_n"
+  )
+
+vital_long
+```
+
+```{r}
+#| label: ins-order
+
+# Shared factor levels so both output tables sort Medicaid / Commercial /
+# Other / Total consistently within each year.
+ins_levels <- c("Medicaid", "Commercial", "Other", "Total")
+```
+
+```{r}
+#| label: helpers
+
+# Both pipelines need the same two shape-fixing steps, and the stage tables
+# need them once per stage, so they're factored out here.
+
+# Fold the QC-only 'Not Enrolled' bucket into 'Other' so the categories line
+# up 1:1 with the 3-way vital stats split, then re-aggregate.
+fold_not_enrolled <- function(df, keys, value_cols) {
+  df |>
+    mutate(ins = if_else(ins == "Not Enrolled", "Other", ins)) |>
+    group_by(across(all_of(c(keys, "ins")))) |>
+    summarise(across(all_of(value_cols), sum), .groups = "drop")
+}
+
+# Append a per-key 'Total' row summed across insurance categories.
+add_ins_total <- function(df, keys, value_cols) {
+  totals <- df |>
+    group_by(across(all_of(keys))) |>
+    summarise(across(all_of(value_cols), sum), .groups = "drop") |>
+    mutate(ins = "Total")
+
+  bind_rows(df, totals) |>
+    mutate(ins = factor(ins, levels = ins_levels)) |>
+    # !!!syms rather than across()/pick() so this works on older dplyr too
+    arrange(!!!syms(c(keys, "ins")))
+}
+```
+
+## Pulling the stage tables
+
+Everything downstream - headline tables included - is derived from these two
+frames, so the filtered and unfiltered views can never drift apart: they are
+literally different rows of the same pull.
+
+```{r}
+#| label: pull-stage-counts
+
+delivery_value_cols <- c("n_mothers", "n_babies", "n_babies_asis", "n_claims", "n_code_hits")
+newborn_value_cols  <- c("n_newborns", "n_claims", "n_code_hits")
+
+# The _raw frames keep 'Not Enrolled' as its own category. Now that the
+# enrollment age filters are gone that bucket is actually populated, so it is
+# worth measuring before it gets folded into 'Other' (see Enrollment QC below).
+delivery_stages_raw <- dbGetQuery(uthealth, "
+  SELECT stage_num, stage, year, ins,
+         n_mothers, n_babies, n_babies_asis, n_claims, n_code_hits
+  FROM colour.delivery_counts_by_stage
+  ORDER BY stage_num, year, ins
+") |>
+  as_tibble()
+
+newborn_stages_raw <- dbGetQuery(uthealth, "
+  SELECT stage_num, stage, year, ins,
+         n_newborns, n_claims, n_code_hits
+  FROM colour.newborn_counts_by_stage
+  ORDER BY stage_num, year, ins
+") |>
+  as_tibble()
+
+delivery_stages <- delivery_stages_raw |>
+  fold_not_enrolled(keys = c("stage_num", "stage", "year"),
+                    value_cols = delivery_value_cols) |>
+  add_ins_total(keys = c("stage_num", "stage", "year"),
+                value_cols = delivery_value_cols)
+
+newborn_stages <- newborn_stages_raw |>
+  fold_not_enrolled(keys = c("stage_num", "stage", "year"),
+                    value_cols = newborn_value_cols) |>
+  add_ins_total(keys = c("stage_num", "stage", "year"),
+                value_cols = newborn_value_cols)
+
+# Label for the selected headline stage, pulled from the data rather than
+# hard-coded so table titles can't fall out of sync with headline_stage.
+headline_label <- delivery_stages |>
+  filter(stage_num == headline_stage) |>
+  pull(stage) |>
+  unique()
+
+stopifnot(length(headline_label) == 1)
+headline_label
+
+delivery_stages
+newborn_stages
+```
+
+## Deliveries (Mothers + Babies)
+
+```{r}
+#| label: delivery-headline
+
+# Headline = the selected stage only. n_babies here is the stage-restricted
+# birth count (age-eligible claims only from stage 2 on); n_babies_asis for
+# the same population is in the Delivery Stages tab.
+delivery_all <- delivery_stages |>
+  filter(stage_num == headline_stage) |>
+  select(year, ins, n_mothers, n_babies)
+
+delivery_all
+```
+
+```{r}
+#| label: delivery-compare
+
+delivery_comparison <- delivery_all |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_mothers     = n_mothers - vital_n,
+    pct_diff_mothers = diff_mothers / vital_n,
+    diff_babies      = n_babies - vital_n,
+    pct_diff_babies  = diff_babies / vital_n
+  ) |>
+  arrange(year, ins)
+
+delivery_comparison
+```
+
+```{r}
+#| label: table-deliveries
+
+delivery_comparison |>
+  mutate(
+    pct_diff_mothers = percent(pct_diff_mothers, accuracy = 0.1),
+    pct_diff_babies  = percent(pct_diff_babies, accuracy = 0.1)
+  ) |>
+  gt(groupname_col = "year") |>
+  tab_header(
+    title    = "Claims-Identified Deliveries vs. TX Vital Statistics Births",
+    subtitle = glue("After DOB filtering - stage {headline_stage}: {headline_label}")
+  ) |>
+  cols_label(
+    ins               = "Insurance Category",
+    n_mothers         = "Claims Mothers",
+    n_babies          = "Claims Births (baby_count-adj.)",
+    vital_n           = "Vital Stats Births",
+    diff_mothers      = "Diff (Mothers)",
+    pct_diff_mothers  = "% Diff (Mothers)",
+    diff_babies       = "Diff (Births)",
+    pct_diff_babies   = "% Diff (Births)"
+  ) |>
+  fmt_number(columns = c(n_mothers, n_babies, vital_n, diff_mothers, diff_babies), decimals = 0)
+```
+
+```{r}
+#| label: fig-deliveries
+#| fig-cap: "Claims-identified births (baby_count-adjusted, after DOB filtering) vs. vital statistics births, by insurance category"
+
+delivery_comparison |>
+  filter(ins != "Total") |>
+  pivot_longer(cols = c(n_babies, vital_n), names_to = "source", values_to = "n") |>
+  mutate(source = recode(source, n_babies = "Claims (Births)", vital_n = "Vital Stats")) |>
+  ggplot(aes(x = year, y = n, color = source)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins, scales = "free_y") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count", color = NULL) +
+  theme_minimal()
+```
+
+## Newborns
+
+```{r}
+#| label: newborn-headline
+
+newborn_all <- newborn_stages |>
+  filter(stage_num == headline_stage) |>
+  select(year, ins, n_newborns)
+
+newborn_all
+```
+
+```{r}
+#| label: newborn-compare
+
+newborn_comparison <- newborn_all |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_newborns     = n_newborns - vital_n,
+    pct_diff_newborns = diff_newborns / vital_n
+  ) |>
+  arrange(year, ins)
+
+newborn_comparison
+```
+
+```{r}
+#| label: table-newborns
+
+newborn_comparison |>
+  mutate(pct_diff_newborns = percent(pct_diff_newborns, accuracy = 0.1)) |>
+  gt(groupname_col = "year") |>
+  tab_header(
+    title    = "Claims-Identified Newborns vs. TX Vital Statistics Births",
+    subtitle = glue("After DOB filtering - stage {headline_stage}: {headline_label}")
+  ) |>
+  cols_label(
+    ins               = "Insurance Category",
+    n_newborns        = "Claims Newborns",
+    vital_n           = "Vital Stats Births",
+    diff_newborns     = "Diff (Newborns)",
+    pct_diff_newborns = "% Diff (Newborns)"
+  ) |>
+  fmt_number(columns = c(n_newborns, vital_n, diff_newborns), decimals = 0)
+```
+
+```{r}
+#| label: fig-newborns
+#| fig-cap: "Claims-identified newborns (after DOB filtering) vs. vital statistics births, by insurance category"
+
+newborn_comparison |>
+  filter(ins != "Total") |>
+  pivot_longer(cols = c(n_newborns, vital_n), names_to = "source", values_to = "n") |>
+  mutate(source = recode(source, n_newborns = "Claims (Newborns)", vital_n = "Vital Stats")) |>
+  ggplot(aes(x = year, y = n, color = source)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins, scales = "free_y") +
+  scale_y_continuous(labels = comma) +
+  labs(x = NULL, y = "Count", color = NULL) +
+  theme_minimal()
+```
+
+## Overall Summary
+
+Combines just the per-year **Total** rows from both pipelines (all insurance
+categories combined) into one high-level table, at the headline filter stage.
+
+```{r}
+#| label: overall-compare
+
+overall_comparison <- delivery_comparison |>
+  filter(ins == "Total") |>
+  select(year, vital_n, n_mothers, diff_mothers, pct_diff_mothers,
+         n_babies, diff_babies, pct_diff_babies) |>
+  left_join(
+    newborn_comparison |>
+      filter(ins == "Total") |>
+      select(year, n_newborns, diff_newborns, pct_diff_newborns),
+    by = "year"
+  )
+
+overall_comparison
+```
+
+```{r}
+#| label: table-overall
+
+overall_comparison |>
+  mutate(
+    pct_diff_mothers  = percent(pct_diff_mothers, accuracy = 0.1),
+    pct_diff_babies   = percent(pct_diff_babies, accuracy = 0.1),
+    pct_diff_newborns = percent(pct_diff_newborns, accuracy = 0.1)
+  ) |>
+  gt() |>
+  tab_header(
+    title    = "Overall (All Insurance Categories Combined) vs. TX Vital Statistics Births",
+    subtitle = glue("After DOB filtering - stage {headline_stage}: {headline_label}")
+  ) |>
+  cols_label(
+    year              = "Year",
+    vital_n           = "Vital Stats Births",
+    n_mothers         = "Claims Mothers",
+    diff_mothers      = "Diff (Mothers)",
+    pct_diff_mothers  = "% Diff (Mothers)",
+    n_babies          = "Claims Births (baby_count-adj.)",
+    diff_babies       = "Diff (Births)",
+    pct_diff_babies   = "% Diff (Births)",
+    n_newborns        = "Claims Newborns",
+    diff_newborns     = "Diff (Newborns)",
+    pct_diff_newborns = "% Diff (Newborns)"
+  ) |>
+  fmt_number(
+    columns = c(vital_n, n_mothers, diff_mothers, n_babies, diff_babies, n_newborns, diff_newborns),
+    decimals = 0
+  )
+```
+
+# DOB Filter Effects
+
+Everything from here down carries all four stages, including the pre-DOB
+stage 0 that the headline tables above used to report.
+
+```{r}
+#| label: stage-effect
+
+# Within each (year, ins), express every stage relative to the one above it
+# (`_drop`, negative = rows lost) and relative to stage 0 (`_pct_of_base`).
+add_stage_effect <- function(df, value_cols) {
+  df |>
+    group_by(year, ins) |>
+    arrange(stage_num, .by_group = TRUE) |>
+    mutate(across(
+      all_of(value_cols),
+      list(
+        drop        = ~ .x - lag(.x),
+        pct_of_base = ~ .x / first(.x)
+      ),
+      .names = "{.col}_{.fn}"
+    )) |>
+    ungroup() |>
+    arrange(year, ins, stage_num)
+}
+
+delivery_stage_effect <- delivery_stages |>
+  add_stage_effect(c("n_mothers", "n_babies", "n_claims"))
+
+newborn_stage_effect <- newborn_stages |>
+  add_stage_effect(c("n_newborns", "n_claims"))
+
+delivery_stage_effect
+newborn_stage_effect
+```
+
+## Deliveries: what each exclusion costs
+
+```{r}
+#| label: table-delivery-stages
+
+delivery_stage_effect |>
+  filter(ins == "Total") |>
+  select(year, stage, n_mothers, n_mothers_drop, n_mothers_pct_of_base,
+         n_babies, n_babies_asis, n_claims, n_claims_drop, n_claims_pct_of_base) |>
+  mutate(
+    n_mothers_pct_of_base = percent(n_mothers_pct_of_base, accuracy = 0.1),
+    n_claims_pct_of_base  = percent(n_claims_pct_of_base, accuracy = 0.1)
+  ) |>
+  gt(groupname_col = "year") |>
+  tab_header(
+    title    = "Deliveries: Effect of DOB-Based Exclusions",
+    subtitle = "All insurance categories combined; cumulative stages. Stage 0 = pre-DOB counts"
+  ) |>
+  cols_label(
+    stage                 = "Stage",
+    n_mothers             = "Mothers",
+    n_mothers_drop        = "Mothers Lost",
+    n_mothers_pct_of_base = "% of Stage 0",
+    n_babies              = "Births (stage-restricted)",
+    n_babies_asis         = "Births (as is)",
+    n_claims              = "Claims",
+    n_claims_drop         = "Claims Lost",
+    n_claims_pct_of_base  = "% of Stage 0"
+  ) |>
+  fmt_number(
+    columns = c(n_mothers, n_mothers_drop, n_babies, n_babies_asis, n_claims, n_claims_drop),
+    decimals = 0
+  )
+```
+
+```{r}
+#| label: fig-delivery-stages
+#| fig-cap: "Share of the stage-0 delivery population retained at each DOB filter stage, by insurance category"
+
+delivery_stage_effect |>
+  select(year, ins, stage, n_mothers_pct_of_base, n_claims_pct_of_base) |>
+  pivot_longer(
+    cols = c(n_mothers_pct_of_base, n_claims_pct_of_base),
+    names_to = "measure", values_to = "pct"
+  ) |>
+  mutate(measure = recode(measure,
+    n_mothers_pct_of_base = "Mothers",
+    n_claims_pct_of_base  = "Claims"
+  )) |>
+  ggplot(aes(x = year, y = pct, color = stage, linetype = measure)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins) +
+  scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "% of stage 0", color = NULL, linetype = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.box = "vertical")
+```
+
+## Newborns: what each exclusion costs
+
+```{r}
+#| label: table-newborn-stages
+
+newborn_stage_effect |>
+  filter(ins == "Total") |>
+  select(year, stage, n_newborns, n_newborns_drop, n_newborns_pct_of_base,
+         n_claims, n_claims_drop, n_claims_pct_of_base) |>
+  mutate(
+    n_newborns_pct_of_base = percent(n_newborns_pct_of_base, accuracy = 0.1),
+    n_claims_pct_of_base   = percent(n_claims_pct_of_base, accuracy = 0.1)
+  ) |>
+  gt(groupname_col = "year") |>
+  tab_header(
+    title    = "Newborns: Effect of DOB-Based Exclusions",
+    subtitle = "All insurance categories combined; cumulative stages. Stage 0 = pre-DOB counts"
+  ) |>
+  cols_label(
+    stage                  = "Stage",
+    n_newborns             = "Newborns",
+    n_newborns_drop        = "Newborns Lost",
+    n_newborns_pct_of_base = "% of Stage 0",
+    n_claims               = "Claims",
+    n_claims_drop          = "Claims Lost",
+    n_claims_pct_of_base   = "% of Stage 0"
+  ) |>
+  fmt_number(
+    columns = c(n_newborns, n_newborns_drop, n_claims, n_claims_drop),
+    decimals = 0
+  )
+```
+
+```{r}
+#| label: fig-newborn-stages
+#| fig-cap: "Share of the stage-0 newborn population retained at each DOB filter stage, by insurance category"
+
+newborn_stage_effect |>
+  select(year, ins, stage, n_newborns_pct_of_base, n_claims_pct_of_base) |>
+  pivot_longer(
+    cols = c(n_newborns_pct_of_base, n_claims_pct_of_base),
+    names_to = "measure", values_to = "pct"
+  ) |>
+  mutate(measure = recode(measure,
+    n_newborns_pct_of_base = "Newborns",
+    n_claims_pct_of_base   = "Claims"
+  )) |>
+  ggplot(aes(x = year, y = pct, color = stage, linetype = measure)) +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ ins) +
+  scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "% of stage 0", color = NULL, linetype = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom", legend.box = "vertical")
+```
+
+## Claim counts across stages
+
+Person counts and claim counts don't have to move together - an exclusion can
+drop a small number of people carrying a large number of claims, or shave
+out-of-window claims off people who stay in. This pulls the claim side out on
+its own for both pipelines.
+
+```{r}
+#| label: claim-counts
+
+claim_counts <- bind_rows(
+  delivery_stage_effect |>
+    filter(ins == "Total") |>
+    transmute(
+      pipeline = "Deliveries",
+      year, stage_num, stage,
+      n_claims, n_claims_drop, n_claims_pct_of_base,
+      n_code_hits,
+      n_persons = n_mothers
+    ),
+  newborn_stage_effect |>
+    filter(ins == "Total") |>
+    transmute(
+      pipeline = "Newborns",
+      year, stage_num, stage,
+      n_claims, n_claims_drop, n_claims_pct_of_base,
+      n_code_hits,
+      n_persons = n_newborns
+    )
+) |>
+  mutate(claims_per_person = n_claims / n_persons) |>
+  arrange(pipeline, year, stage_num)
+
+claim_counts
+```
+
+```{r}
+#| label: table-claim-counts
+
+claim_counts |>
+  mutate(n_claims_pct_of_base = percent(n_claims_pct_of_base, accuracy = 0.1)) |>
+  select(pipeline, year, stage, n_claims, n_claims_drop, n_claims_pct_of_base,
+         n_code_hits, n_persons, claims_per_person) |>
+  gt(groupname_col = "pipeline") |>
+  tab_header(title = "Claim Counts by Filter Stage") |>
+  cols_label(
+    year                 = "Year",
+    stage                = "Stage",
+    n_claims             = "Claims",
+    n_claims_drop        = "Claims Lost",
+    n_claims_pct_of_base = "% of Stage 0",
+    n_code_hits          = "Matched Code Rows",
+    n_persons            = "Persons",
+    claims_per_person    = "Claims / Person"
+  ) |>
+  fmt_number(columns = c(n_claims, n_claims_drop, n_code_hits, n_persons), decimals = 0) |>
+  fmt_number(columns = claims_per_person, decimals = 2)
+```
+
+## Enrollment QC
+
+With the enrollment age filters gone, a person with no `agg_yr_plan` row for
+that year is no longer dropped - they land in `Not Enrolled` and then get folded
+into `Other`. This sizes that bucket *before* the fold, so it's clear how much
+of `Other` is genuinely unenrolled people rather than
+Medicare/Federal coverage. A large or year-varying share here would undercut
+the `Other` comparison against `self_pay + other + unknown_or_not_stated`.
+
+```{r}
+#| label: enrollment-qc
+
+enrollment_qc <- bind_rows(
+  delivery_stages_raw |>
+    transmute(pipeline = "Deliveries", stage_num, stage, year, ins,
+              n_persons = n_mothers, n_claims),
+  newborn_stages_raw |>
+    transmute(pipeline = "Newborns", stage_num, stage, year, ins,
+              n_persons = n_newborns, n_claims)
+) |>
+  group_by(pipeline, stage_num, stage, year) |>
+  # The 'Not Enrolled' subsets come FIRST: summarise() evaluates sequentially,
+  # so if n_persons were reassigned above them they'd index the new scalar
+  # rather than the original column.
+  summarise(
+    n_not_enrolled        = sum(n_persons[ins == "Not Enrolled"]),
+    n_claims_not_enrolled = sum(n_claims[ins == "Not Enrolled"]),
+    n_persons             = sum(n_persons),
+    n_claims              = sum(n_claims),
+    .groups = "drop"
+  ) |>
+  mutate(pct_not_enrolled = n_not_enrolled / n_persons) |>
+  arrange(pipeline, year, stage_num)
+
+enrollment_qc
+```
+
+```{r}
+#| label: table-enrollment-qc
+
+enrollment_qc |>
+  mutate(pct_not_enrolled = percent(pct_not_enrolled, accuracy = 0.1)) |>
+  select(pipeline, year, stage, n_persons, n_not_enrolled, pct_not_enrolled,
+         n_claims, n_claims_not_enrolled) |>
+  gt(groupname_col = "pipeline") |>
+  tab_header(
+    title    = "Unenrolled Share by Filter Stage",
+    subtitle = "Persons with no agg_yr_plan match for that year, before folding into Other"
+  ) |>
+  cols_label(
+    year                  = "Year",
+    stage                 = "Stage",
+    n_persons             = "Persons",
+    n_not_enrolled        = "Not Enrolled",
+    pct_not_enrolled      = "% Not Enrolled",
+    n_claims              = "Claims",
+    n_claims_not_enrolled = "Claims (Not Enrolled)"
+  ) |>
+  fmt_number(
+    columns = c(n_persons, n_not_enrolled, n_claims, n_claims_not_enrolled),
+    decimals = 0
+  )
+```
+
+## DOB QC (non-cumulative)
+
+Sizes each exclusion on its own terms: how many of the stage-0 population have
+no DOB at all, how many have more than one, and - within each of those groups -
+how many still have at least one qualifying claim (within 7 days of DOB for
+infants, age 12-50 at DOS for mothers).
+
+```{r}
+#| label: pull-dob-qc
+
+delivery_dob_qc <- dbGetQuery(uthealth, "
+  SELECT year, ins, dob_status,
+         n_mothers, n_mothers_age_ok, n_babies, n_claims, n_claims_age_ok
+  FROM colour.delivery_dob_qc
+  ORDER BY year, ins, dob_status
+") |>
+  as_tibble() |>
+  rename(n_persons = n_mothers, n_persons_ok = n_mothers_age_ok,
+         n_claims_ok = n_claims_age_ok) |>
+  mutate(pipeline = "Deliveries") |>
+  # n_babies is delivery-only; dropped here so the two pipelines stack cleanly
+  select(-n_babies)
+
+newborn_dob_qc <- dbGetQuery(uthealth, "
+  SELECT year, ins, dob_status,
+         n_newborns, n_newborns_in_window, n_claims, n_claims_in_window
+  FROM colour.newborn_dob_qc
+  ORDER BY year, ins, dob_status
+") |>
+  as_tibble() |>
+  rename(n_persons = n_newborns, n_persons_ok = n_newborns_in_window,
+         n_claims_ok = n_claims_in_window) |>
+  mutate(pipeline = "Newborns")
+
+dob_qc <- bind_rows(delivery_dob_qc, newborn_dob_qc) |>
+  mutate(ins = if_else(ins == "Not Enrolled", "Other", ins)) |>
+  group_by(pipeline, year, ins, dob_status) |>
+  summarise(across(c(n_persons, n_persons_ok, n_claims, n_claims_ok), sum),
+            .groups = "drop") |>
+  group_by(pipeline, year) |>
+  mutate(pct_of_year = n_persons / sum(n_persons)) |>
+  ungroup() |>
+  arrange(pipeline, year, ins, dob_status)
+
+dob_qc
+```
+
+```{r}
+#| label: table-dob-qc
+
+dob_qc |>
+  group_by(pipeline, year, dob_status) |>
+  summarise(across(c(n_persons, n_persons_ok, n_claims, n_claims_ok), sum), .groups = "drop") |>
+  group_by(pipeline, year) |>
+  mutate(pct_of_year = n_persons / sum(n_persons)) |>
+  ungroup() |>
+  mutate(pct_of_year = percent(pct_of_year, accuracy = 0.1)) |>
+  gt(groupname_col = "pipeline") |>
+  tab_header(
+    title    = "DOB Availability in the Stage-0 Population",
+    subtitle = "All insurance categories combined"
+  ) |>
+  cols_label(
+    year         = "Year",
+    dob_status   = "DOB Status",
+    n_persons    = "Persons",
+    pct_of_year  = "% of Year",
+    n_persons_ok = "Persons w/ Qualifying Claim",
+    n_claims     = "Claims",
+    n_claims_ok  = "Qualifying Claims"
+  ) |>
+  fmt_number(columns = c(n_persons, n_persons_ok, n_claims, n_claims_ok), decimals = 0)
+```
+
+## Filtered counts vs. vital statistics
+
+The point of the exclusions is accuracy, not just attrition - this checks
+whether each stage moves the claims counts toward or away from the vital
+stats benchmark. The headline stage's rows here are the same numbers as the
+Overall / Deliveries / Newborns tables above.
+
+```{r}
+#| label: stages-vs-vital
+
+delivery_stages_vs_vital <- delivery_stages |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_babies     = n_babies - vital_n,
+    pct_diff_babies = diff_babies / vital_n
+  ) |>
+  arrange(year, ins, stage_num)
+
+newborn_stages_vs_vital <- newborn_stages |>
+  left_join(vital_long, by = c("year", "ins")) |>
+  mutate(
+    diff_newborns     = n_newborns - vital_n,
+    pct_diff_newborns = diff_newborns / vital_n
+  ) |>
+  arrange(year, ins, stage_num)
+
+delivery_stages_vs_vital
+newborn_stages_vs_vital
+```
+
+```{r}
+#| label: fig-stages-vs-vital
+#| fig-cap: "% difference from vital statistics births at each filter stage (Total across insurance categories)"
+
+bind_rows(
+  delivery_stages_vs_vital |>
+    filter(ins == "Total") |>
+    transmute(pipeline = "Deliveries (births)", year, stage, pct_diff = pct_diff_babies),
+  newborn_stages_vs_vital |>
+    filter(ins == "Total") |>
+    transmute(pipeline = "Newborns", year, stage, pct_diff = pct_diff_newborns)
+) |>
+  ggplot(aes(x = year, y = pct_diff, color = stage)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_line() +
+  geom_point() +
+  facet_wrap(~ pipeline) +
+  scale_y_continuous(labels = percent) +
+  labs(x = NULL, y = "% difference from vital stats", color = NULL) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+```
+
+## Export to Excel
+
+Ten tabs, each a real Excel Table (banded rows + filter dropdowns, via
+`writeDataTable()`) except Steps, which is documentation. Tabs 1-3 are the
+fully filtered counts; tabs 4-9 carry all four stages including the
+unfiltered stage 0:
+
+1. **Overall** - Total-row-only summary across both pipelines, filtered (first tab)
+2. **Deliveries** - mother count + baby count vs. vital stats, by category + Total, filtered
+3. **Newborns** - person count vs. vital stats, by category + Total, filtered
+4. **Delivery Stages** - DOB filter waterfall for deliveries, stage 0 through 3
+5. **Newborn Stages** - DOB filter waterfall for newborns, stage 0 through 3
+6. **Claim Counts** - claim-side view of the waterfall, both pipelines
+7. **DOB QC** - No DOB / Single DOB / Multiple DOB split of the stage-0 population
+8. **Enrollment QC** - unenrolled share by stage, before folding into Other
+9. **Stages vs Vital** - each stage's counts against the vital stats benchmark
+10. **Steps** - methodology notes (last tab)
+
+```{r}
+#| label: export-to-excel
+
+# -- EDIT THIS --------------------------------------------------
+out_path <- here::here("claims_vs_vital_stats_comparison.xlsx")
+# -----------------------------------------------------------------
+
+wb <- createWorkbook()
+
+table_style <- "TableStyleMedium9"
+
+# Sheet name -> data frame. Order here is the tab order in the workbook.
+sheets <- list(
+  "Overall"          = overall_comparison,
+  "Deliveries"       = delivery_comparison,
+  "Newborns"         = newborn_comparison,
+  "Delivery Stages"  = delivery_stage_effect,
+  "Newborn Stages"   = newborn_stage_effect,
+  "Claim Counts"     = claim_counts,
+  "DOB QC"           = dob_qc,
+  "Enrollment QC"    = enrollment_qc,
+  "Stages vs Vital"  = bind_rows(
+    delivery_stages_vs_vital |>
+      transmute(pipeline = "Deliveries", stage_num, stage, year, ins,
+                n = n_babies, vital_n, diff = diff_babies, pct_diff = pct_diff_babies),
+    newborn_stages_vs_vital |>
+      transmute(pipeline = "Newborns", stage_num, stage, year, ins,
+                n = n_newborns, vital_n, diff = diff_newborns, pct_diff = pct_diff_newborns)
+  )
+)
+
+# openxlsx's widths = "auto" is unreliable about leaving room for the
+# header text itself (it can underestimate and clip column names), so
+# size each column explicitly off the wider of the header name or its
+# longest formatted value instead.
+set_widths_for_headers <- function(wb, sheet, df) {
+  if (nrow(df) == 0) return(invisible(NULL))
+  col_widths <- vapply(seq_along(df), function(i) {
+    header_len <- nchar(names(df)[i])
+    data_len   <- suppressWarnings(max(nchar(format(df[[i]])), na.rm = TRUE))
+    if (!is.finite(data_len)) data_len <- 0
+    max(header_len, data_len) + 2
+  }, numeric(1))
+  setColWidths(wb, sheet, cols = seq_along(df), widths = col_widths)
+}
+
+# writeDataTable doesn't take a numFmt arg, so percent formatting is
+# applied as a separate style pass on top of each table. Anything named
+# pct_* or *_pct_of_base is a proportion and gets the 0.0% format.
+pct_style <- createStyle(numFmt = "0.0%")
+
+for (sheet_name in names(sheets)) {
+  df <- sheets[[sheet_name]]
+
+  addWorksheet(wb, sheet_name)
+  writeDataTable(wb, sheet_name, df, tableStyle = table_style)
+
+  pct_cols <- which(grepl("^pct_|_pct_of_base$|^pct_of_year$", names(df)))
+  if (length(pct_cols) > 0 && nrow(df) > 0) {
+    addStyle(
+      wb, sheet_name, pct_style,
+      rows = 2:(nrow(df) + 1),
+      cols = pct_cols,
+      gridExpand = TRUE
+    )
+  }
+
+  set_widths_for_headers(wb, sheet_name, df)
+}
+
+# A note row above each filtered tab would break the Excel Table, so the
+# headline stage is recorded on the Steps tab instead (see below).
+
+# ------------------------------------------------------------------
+# Steps tab (methodology notes - plain text, not a data table)
+# ------------------------------------------------------------------
+
+steps_text <- c(
+  "Get counts and compare to vital stats",
+  "",
+  glue("Overall / Deliveries / Newborns tabs report stage {headline_stage}: {headline_label}"),
+  "The Delivery Stages, Newborn Stages, Claim Counts and Stages vs Vital tabs carry",
+  "every stage, including the unfiltered stage 0 (pre-DOB counts).",
+  "",
+  "Infants:",
+  "- Get all claims using \"Newborn Codes\" tab of Orr codelists (CPT and DX)",
+  "- No enrollment age filter (the old age < 1 filter has been removed)",
+  "- Left join colour.dob on pers_id; keep dob_derv and the multiple-DOB flag",
+  "- Qualifying claim = date of service within +/- 7 days of dob_derv",
+  "- Get count distinct people",
+  "",
+  "Deliveries:",
+  "- Get all claims using \"Delivery Codes\" tab of Orr codelists (CPT and DX)",
+  "- No enrollment age filter (the old age > 12 filter has been removed)",
+  "- Left join to enrollment for insurance; no match for the year = Not Enrolled",
+  "- Left join colour.dob on pers_id; keep dob_derv and the multiple-DOB flag",
+  "- Qualifying claim = age at date of service between 12 and 50 inclusive",
+  "- Get one instance per person per year taking the maximum baby count for that year (for non-babycount codes, coalesce value of 1)",
+  "",
+  "DOB filter stages (cumulative, both pipelines):",
+  "- Stage 0: all matched claims at any age - looser than the old pipeline,",
+  "  which also applied an enrollment age filter. Stages 2-3 are comparable.",
+  "- Stage 1: + person has a DOB in colour.dob",
+  "- Stage 2: + person has at least one qualifying claim (7-day window / age 12-50)",
+  "- Stage 3: + person has a single DOB only (colour.dob.mult_dob is null)",
+  "- From stage 2 on, claim counts and baby counts use qualifying claims only;",
+  "  n_babies_asis carries the unrestricted baby_count through every stage",
+  "",
+  "Counts reported at every stage:",
+  "- Persons (count distinct pers_id)",
+  "- Claims (count distinct clm_id) and matched code rows (a claim can hit several codes)",
+  "- Births (sum of baby_count) for deliveries, both stage-restricted and as is",
+  "",
+  "Notes:",
+  "- There is overlap of codes between deliveries and codesets",
+  "- Age is now controlled only by the DOB criteria at stage 2, so stage 0 and 1",
+  "  counts include people of any age with a matched code",
+  "- Not Enrolled (no agg_yr_plan match for the year) is folded into Other to",
+  "  match the 3-way vital stats split; see the Enrollment QC tab for its size",
+  "- Vital Stats are recorded as the mother's insurance (not necessarily the baby's)",
+  "- colour.dob is assumed unique on pers_id; the SQL collapses it defensively anyway",
+  "- colour.dob.mult_dob is a null/1 flag: 1 = more than one DOB on file,",
+  "  null = single DOB. The dobs array is carried as n_dobs for QC only",
+  "- NY Vital Stats: Link",
+  "- TX Vital Stats:"
+)
+header_rows <- which(steps_text %in% c(
+  "Get counts and compare to vital stats",
+  "Infants:",
+  "Deliveries:",
+  "DOB filter stages (cumulative, both pipelines):",
+  "Counts reported at every stage:",
+  "Notes:"
+))
+tx_row <- length(steps_text)
+
+# -- EDIT THIS: the jsessionid pasted in chat is a temporary session
+# token that will have expired - swap in a fresh/permanent query URL
+# if you have one -----------------------------------------------
+tx_url <- "https://wonder.cdc.gov/controller/datarequest/D149"
+# -----------------------------------------------------------------
+
+addWorksheet(wb, "Steps")
+writeData(wb, "Steps", steps_text, colNames = FALSE)
+addStyle(wb, "Steps", createStyle(textDecoration = "bold", fontSize = 12), rows = header_rows, cols = 1)
+
+class(tx_url) <- "hyperlink"
+writeData(wb, "Steps", x = tx_url, startCol = 2, startRow = tx_row)
+
+setColWidths(wb, "Steps", cols = 1, widths = 100)
+setColWidths(wb, "Steps", cols = 2, widths = 55)
+
+saveWorkbook(wb, out_path, overwrite = TRUE)
+
+cat("Wrote comparison workbook to", out_path, "\n")
+```
+
+```{r}
+#| label: disconnect
+
+dbDisconnect(uthealth)
+```
